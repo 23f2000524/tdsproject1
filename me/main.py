@@ -3,7 +3,8 @@
 # dependencies = [
 #   "fastapi[standard]",
 #   "uvicorn",
-#   "requests"
+#   "requests",
+#   "base64"
 # ]
 # ///
 import os
@@ -14,21 +15,29 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 def validate_secret(secret: str) -> bool:
     return secret == os.getenv("SECRET_KEY")
 
-def round1(data):
-    files = write_code_with_llm()
-    
-    create_repo(f"{data['id']}_{data['nonce']}")
-    enable_pages(f"{data['id']}_{data['nonce']}")
-    push_files_to_pages(f"{data['id']}_{data['nonce']}",files, 1)
+
 import base64
 
 def round1(data):
+    if data.get("attachments", []):
+        attachfiles = parse_attachments(data)
+    if data.get("checks", []):
+        checks = data["checks"]
     prompt = f"""
     You are to create a simple web app based on this brief:
     {data['brief']}
     Make sure it works when deployed to GitHub Pages.
     Use HTML + JS + minimal CSS.
+    include only code files and no explanations or markdown formatting.
+    The app should be contained in a single HTML file named index.html.
+    The following are the attachments provided, you can use them as needed:
+    {', '.join([f['name']+"\n"+f['content']+"\n \n" for f in attachfiles]) if data.get("attachments") else 'No attachments provided'}
+    -------------
+    it must pass the following checks:
+    {', '.join([f['name']+"\n" for f in checks]) if data.get("checks") else 'No checks provided'}
+
     """
+
     files = write_code_with_llm(prompt)
     
     repo_name = f"{data['id']}-{data['nonce']}"
@@ -39,25 +48,100 @@ def round1(data):
     for f in files:
         f["content"] = base64.b64encode(f["content"].encode()).decode()
 
-    push_files_to_pages(repo_name, files, 1)
+    commit_sha = push_files_to_pages(repo_name, files, 1)
 
     # Send POST back to evaluation URL
-    post_evaluation(data, repo_name)
+    post_evaluation(data, repo_name, commit_sha)
+
+def parse_attachments(data: dict)-> list[dict]:
+    """
+    Parse attachments array and decode data: URIs into file objects:
+    returns list of {"name": ..., "content": "..."}
+    """
+    files = []
+    for att in data.get("attachments", []):
+        name = att.get("name")
+        url = att.get("url", "")
+        if not name or not url:
+            continue
+        if url.startswith("data:"):
+            try:
+                header, b64 = url.split(",", 1)
+                decoded = base64.b64decode(b64)
+                # try decode as text; if binary, keep as bytes (we base64-encode later)
+                try:
+                    text = decoded.decode("utf-8")
+                    files.append({"name": name, "content": text, "binary": False})
+                except UnicodeDecodeError:
+                    files.append({"name": name, "content": decoded, "binary": True})
+            except Exception as e:
+                raise ValueError(f"Invalid data URI for attachment {name}: {e}")
+        else:
+            # non-data URIs are not fetched for security/simplicity; treat as placeholder
+            raise ValueError("Only data: attachments are supported by this service.")
+    return files
+
+def round2(data):
+
+    repo_name = f"{data['id']}-{data['nonce']}"
+    
+    for i, subround in enumerate(data.get("round2", []), start=1):
+        print(f"--- Starting Round 2.{i} ---")
+
+        if subround.get("attachments", []):
+            attachfiles = parse_attachments(subround)
+        else:
+            attachfiles = []
+
+        checks = subround.get("checks", [])
+
+        prompt = f"""
+        You are to modify the existing web app (index.html) based on this new brief:
+        {subround['brief']}
+
+        The app already exists in the GitHub repository: {repo_name}
+        You must update the existing index.html to fulfill the new requirements.
+
+        Keep using HTML + JS + minimal CSS.
+        Maintain compatibility with GitHub Pages.
+
+        Attachments (if any) that you can use:
+        {', '.join([f['name'] + '\\n' + f['content'] + '\\n\\n' for f in attachfiles]) if attachfiles else 'No new attachments provided'}
+
+        It must pass the following checks:
+        {', '.join([f.get('js', '') for f in checks]) if checks else 'No checks provided'}
+
+        Include only code (no markdown or explanation).
+        The updated app must remain inside a single file: index.html.
+        """
+
+        # Generate the updated HTML with LLM
+        files = write_code_with_llm(prompt)
+
+        # Encode files to base64 before pushing
+        for f in files:
+            f["content"] = base64.b64encode(f["content"].encode()).decode()
+
+        # Push changes to GitHub (Round 2 update mode)
+        commit_sha = push_files_to_pages(repo_name, files, 2)
+
+        # Post evaluation for this sub-round
+        post_evaluation(subround, repo_name, commit_sha)
+
+        print(f"✅ Completed Round 2.{i} | Commit SHA: {commit_sha}")
 
 
-def round2():
-    pass
 
 
 def create_repo(name: str):
     payload={"name":name,
               "private": False,
               "auto_init": True,
-              "lisence_template": "mit"}
+              "license_template": "mit"}
     header={"Authorization": f"Bearer {GITHUB_TOKEN}",
                  "Accept": "application/vnd.github.v3+json"}
     response = requests.post(
-        "https://api.github.com/user/repos",
+        "https://api.github.com/23f2000524/repos",
         headers=header,
         json=payload
               )
@@ -112,19 +196,19 @@ def push_files_to_pages(repo_name: str,files:list[dict],round:int):
     for file in files:
         file_name=file.get("name")
         file_content=file.get("content")
+        
+        if not isinstance(file_content, bytes):
+            file_content = file_content.encode("utf-8")
+        b64_content = base64.b64encode(file_content).decode("utf-8")
         headers={
             "Authorization": f"Bearer {GITHUB_TOKEN}",
             "Accept": "application/vnd.github.v3+json"
             }
         payload={
-            "message": f"Add {file_name}",
-            "content": file_content
+            "message": f"Update {file_name}" if latest_sha else f"Add {file_name}",
+            "content": b64_content
                 }
         
-        if not isinstance(file_content, bytes):
-            file_content = file_content.encode("utf-8")
-        b64_content = base64.b64encode(file_content).decode("utf-8")
-
 
         if latest_sha:
             payload["sha"] = latest_sha
@@ -133,9 +217,9 @@ def push_files_to_pages(repo_name: str,files:list[dict],round:int):
             headers=headers,
             json=payload
                   )
-        if response.status_code not in [201]:
+        if response.status_code not in [200,201]:
             return Exception(f"Failed to push file {file_name} : {response.status_code}, {response.text}")
-    return {"message": "All files pushed successfully"}
+    return response.json()["commit"]["sha"]
 
 def write_code_with_llm(prompt: str):
     API_URL = "https://aipipe.org/openai/v1/chat/completions"
@@ -153,22 +237,21 @@ def write_code_with_llm(prompt: str):
 
     resp = requests.post(API_URL, headers=headers, json=data)
     if resp.status_code != 200:
-        raise Exception(f"LLM API error: {resp.text}")
+        raise Exception(f"LLM API error: {resp.status_code} - {resp.text}")
 
-    code = resp.json()["choices"][0]["message"]["content"]
+    code = resp.json()["choices"][0]["message"]["content"].strip()
     return [
-        {"name": "index.html", "content": code.encode("utf-8").decode("utf-8")},
-        {"name": "README.md", "content": f"# Generated App\n\n{prompt}\n\n---\n\n{code}"}
-    ]
+        {"name": "index.html", "content": code},
+        {"name": "README.md", "content": f"# Generated App\n\n## Brief\n{prompt}\n\n---\n\n## Code\n\n{code}"}    ]
 
-def post_evaluation(data, repo_name):
+def post_evaluation(data, repo_name, commit_sha):
     payload = {
         "email": data["email"],
         "task": data["task"],
         "round": data["round"],
         "nonce": data["nonce"],
         "repo_url": f"https://github.com/23f2000524/{repo_name}",
-        "commit_sha": "latest",  # optional: fetch via API
+        "commit_sha": commit_sha,  # optional: fetch via API
         "pages_url": f"https://23f2000524.github.io/{repo_name}/"
     }
     headers = {"Content-Type": "application/json"}
