@@ -4,11 +4,11 @@
 #   "fastapi[standard]",
 #   "uvicorn",
 #   "requests",
-#   "base64"
 # ]
 # ///
 import os
 import requests
+import base64
 from fastapi import FastAPI
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") 
 
@@ -16,7 +16,6 @@ def validate_secret(secret: str) -> bool:
     return secret == os.getenv("SECRET_KEY")
 
 
-import base64
 
 def round1(data):
     if data.get("attachments", []):
@@ -34,19 +33,17 @@ def round1(data):
     {', '.join([f['name']+"\n"+f['content']+"\n \n" for f in attachfiles]) if data.get("attachments") else 'No attachments provided'}
     -------------
     it must pass the following checks:
-    {', '.join([f['name']+"\n" for f in checks]) if data.get("checks") else 'No checks provided'}
+    {', '.join([f+"\n" for f in checks]) if data.get("checks") else 'No checks provided'}
 
     """
 
     files = write_code_with_llm(prompt)
     
-    repo_name = f"{data['id']}-{data['nonce']}"
+    repo_name = f"{data['task']}-{data['nonce']}"
     create_repo(repo_name)
     enable_pages(repo_name)
     
     # Encode files to base64 before pushing
-    for f in files:
-        f["content"] = base64.b64encode(f["content"].encode()).decode()
 
     commit_sha = push_files_to_pages(repo_name, files, 1)
 
@@ -58,6 +55,15 @@ def parse_attachments(data: dict)-> list[dict]:
     Parse attachments array and decode data: URIs into file objects:
     returns list of {"name": ..., "content": "..."}
     """
+    def safe_b64decode(b64_str: str):
+        # Strip whitespace/newlines
+        b64_str = b64_str.strip()
+        # Add padding if missing
+        missing_padding = len(b64_str) % 4
+        if missing_padding:
+            b64_str += "=" * (4 - missing_padding)
+        return base64.b64decode(b64_str)
+    
     files = []
     for att in data.get("attachments", []):
         name = att.get("name")
@@ -67,13 +73,13 @@ def parse_attachments(data: dict)-> list[dict]:
         if url.startswith("data:"):
             try:
                 header, b64 = url.split(",", 1)
-                decoded = base64.b64decode(b64)
-                # try decode as text; if binary, keep as bytes (we base64-encode later)
+                decoded = safe_b64decode(b64)
                 try:
                     text = decoded.decode("utf-8")
                     files.append({"name": name, "content": text, "binary": False})
                 except UnicodeDecodeError:
-                    files.append({"name": name, "content": decoded, "binary": True})
+                    b64_text = base64.b64encode(decoded).decode("utf-8")
+                    files.append({"name": name, "content": b64_text, "binary": True})
             except Exception as e:
                 raise ValueError(f"Invalid data URI for attachment {name}: {e}")
         else:
@@ -83,7 +89,7 @@ def parse_attachments(data: dict)-> list[dict]:
 
 def round2(data):
 
-    repo_name = f"{data['id']}-{data['nonce']}"
+    repo_name = f"{data['task']}-{data['nonce']}"
     
     for i, subround in enumerate(data.get("round2", []), start=1):
         print(f"--- Starting Round 2.{i} ---")
@@ -109,7 +115,7 @@ def round2(data):
         {', '.join([f['name'] + '\\n' + f['content'] + '\\n\\n' for f in attachfiles]) if attachfiles else 'No new attachments provided'}
 
         It must pass the following checks:
-        {', '.join([f.get('js', '') for f in checks]) if checks else 'No checks provided'}
+        {', '.join(checks) if checks else 'No checks provided'}
 
         Include only code (no markdown or explanation).
         The updated app must remain inside a single file: index.html.
@@ -119,16 +125,15 @@ def round2(data):
         files = write_code_with_llm(prompt)
 
         # Encode files to base64 before pushing
-        for f in files:
-            f["content"] = base64.b64encode(f["content"].encode()).decode()
 
         # Push changes to GitHub (Round 2 update mode)
         commit_sha = push_files_to_pages(repo_name, files, 2)
 
         # Post evaluation for this sub-round
-        post_evaluation(subround, repo_name, commit_sha)
+        post_evaluation(data, repo_name, commit_sha)
 
         print(f"✅ Completed Round 2.{i} | Commit SHA: {commit_sha}")
+    
 
 
 
@@ -136,12 +141,12 @@ def round2(data):
 def create_repo(name: str):
     payload={"name":name,
               "private": False,
-              "auto_init": True,
+              "auto_init": False,
               "license_template": "mit"}
     header={"Authorization": f"Bearer {GITHUB_TOKEN}",
                  "Accept": "application/vnd.github.v3+json"}
     response = requests.post(
-        "https://api.github.com/23f2000524/repos",
+        "https://api.github.com/user/repos",
         headers=header,
         json=payload
               )
@@ -186,6 +191,19 @@ def get_sha_of_latest_commit(repo_name: str, branch: str="main") -> str:
     else:
         return response.json()["object"]["sha"]
     
+def get_file_sha(repo_name: str, file_path: str, branch: str = "main") -> str:
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    resp = requests.get(
+        f"https://api.github.com/repos/23f2000524/{repo_name}/contents/{file_path}?ref={branch}",
+        headers=headers
+    )
+    if resp.status_code != 200:
+        raise Exception(f"Failed to get file sha for {file_path} : {resp.status_code}, {resp.text}")
+    return resp.json()["sha"]
+
 
 def push_files_to_pages(repo_name: str,files:list[dict],round:int):
     if round == 2:
@@ -193,12 +211,17 @@ def push_files_to_pages(repo_name: str,files:list[dict],round:int):
     else:
         latest_sha = None
 
+    commit_sha = None
     for file in files:
         file_name=file.get("name")
         file_content=file.get("content")
-        
+        binary=file.get("binary", False)
         if not isinstance(file_content, bytes):
-            file_content = file_content.encode("utf-8")
+            if binary:
+                # base64 string -> bytes
+                file_content = base64.b64decode(file_content)
+            else:
+                file_content = file_content.encode("utf-8")
         b64_content = base64.b64encode(file_content).decode("utf-8")
         headers={
             "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -210,16 +233,18 @@ def push_files_to_pages(repo_name: str,files:list[dict],round:int):
                 }
         
 
-        if latest_sha:
-            payload["sha"] = latest_sha
+        sha = get_file_sha(repo_name, file_name) if round == 2 else None
+        if sha :
+            payload["sha"] = sha
         response = requests.put(
             f"https://api.github.com/repos/23f2000524/{repo_name}/contents/{file_name}",
             headers=headers,
             json=payload
                   )
         if response.status_code not in [200,201]:
-            return Exception(f"Failed to push file {file_name} : {response.status_code}, {response.text}")
-    return response.json()["commit"]["sha"]
+            raise Exception(f"Failed to push file {file_name} : {response.status_code}, {response.text}")
+        commit_sha = response.json()["commit"]["sha"]
+    return commit_sha
 
 def write_code_with_llm(prompt: str):
     API_URL = "https://aipipe.org/openai/v1/chat/completions"
@@ -276,7 +301,7 @@ def handle_task(data: dict):
             round2(data)
             return {"message": "Round 2 started"}
         else:
-            return {"error", "Invalid round"}
+            return {"error": "Invalid round"}
     print(data)
     return {"message": "Task recieved", "data": data}
 
