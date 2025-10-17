@@ -22,6 +22,16 @@ def round1(data):
         attachfiles = parse_attachments(data)
     if data.get("checks", []):
         checks = data["checks"]
+
+    if attachfiles:
+        attach_text = "\n\n".join([f"{f['name']}\n{f['content']}" for f in attachfiles])
+    else:
+        attach_text = "No attachments provided"
+
+    if checks:
+        checks_text = "\n".join(checks)
+    else:
+        checks_text = "No checks provided"
     prompt = f"""
     You are to create a simple web app based on this brief:
     {data['brief']}
@@ -30,10 +40,9 @@ def round1(data):
     include only code files and no explanations or markdown formatting.
     The app should be contained in a single HTML file named index.html.
     The following are the attachments provided, you can use them as needed:
-    {', '.join([f['name']+"\n"+f['content']+"\n \n" for f in attachfiles]) if data.get("attachments") else 'No attachments provided'}
-    -------------
+    {attach_text}    -------------
     it must pass the following checks:
-    {', '.join([f+"\n" for f in checks]) if data.get("checks") else 'No checks provided'}
+    {checks_text}
 
     """
 
@@ -101,6 +110,9 @@ def round2(data):
 
         checks = subround.get("checks", [])
 
+        attach_text = "\n\n".join([f"{f['name']}\n{f['content']}" for f in attachfiles]) if attachfiles else "No new attachments provided"
+        checks_text = "\n".join(checks) if checks else "No checks provided"
+
         prompt = f"""
         You are to modify the existing web app (index.html) based on this new brief:
         {subround['brief']}
@@ -112,10 +124,10 @@ def round2(data):
         Maintain compatibility with GitHub Pages.
 
         Attachments (if any) that you can use:
-        {', '.join([f['name'] + '\\n' + f['content'] + '\\n\\n' for f in attachfiles]) if attachfiles else 'No new attachments provided'}
+        {attach_text}
 
         It must pass the following checks:
-        {', '.join(checks) if checks else 'No checks provided'}
+        {checks_text}
 
         Include only code (no markdown or explanation).
         The updated app must remain inside a single file: index.html.
@@ -267,7 +279,7 @@ def write_code_with_llm(prompt: str):
     code = resp.json()["choices"][0]["message"]["content"].strip()
     return [
         {"name": "index.html", "content": code},
-        {"name": "README.md", "content": f"# Generated App\n\n## Brief\n{prompt}\n\n---\n\n## Code\n\n{code}"}    ]
+        {"name": "README.md", "content": f"# Generated App\n\n## Latest Code Generated based on :\n{prompt}\n\n---\n\n## Generated Code\n\n{code}"}    ]
 
 def post_evaluation(data, repo_name, commit_sha):
     payload = {
@@ -279,6 +291,7 @@ def post_evaluation(data, repo_name, commit_sha):
         "commit_sha": commit_sha,  # optional: fetch via API
         "pages_url": f"https://23f2000524.github.io/{repo_name}/"
     }
+    print(payload)
     headers = {"Content-Type": "application/json"}
     r = requests.post(data["evaluation_url"], headers=headers, json=payload)
     if r.status_code != 200:
@@ -294,6 +307,7 @@ def handle_task(data: dict):
     if not validate_secret(data.get("secret", "")):
         return {"error": "Incorrect secret"}
     else:
+
         if data.get("round") == 1:
             round1(data)
             return {"message": "Round 1 started"}
@@ -305,6 +319,7 @@ def handle_task(data: dict):
     print(data)
     return {"message": "Task recieved", "data": data}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app,host="0.0.0.0",port=8000)
+
+@app.get("/")
+def root():
+    return {"message": "API is running. Use /handle_task for POST requests."}
