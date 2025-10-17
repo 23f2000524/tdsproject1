@@ -20,8 +20,12 @@ def validate_secret(secret: str) -> bool:
 def round1(data):
     if data.get("attachments", []):
         attachfiles = parse_attachments(data)
+    else:
+        attachfiles = None
     if data.get("checks", []):
         checks = data["checks"]
+    else:
+        checks = None
 
     if attachfiles:
         attach_text = "\n\n".join([f"{f['name']}\n{f['content']}" for f in attachfiles])
